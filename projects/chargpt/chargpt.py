@@ -4,6 +4,7 @@ Trains a character-level language model.
 
 import os
 import sys
+import wandb
 
 import torch
 from torch.utils.data import Dataset
@@ -22,18 +23,23 @@ def get_config():
     # system
     C.system = CN()
     C.system.seed = 3407
-    C.system.work_dir = './out/chargpt'
+    C.system.work_dir = "./out/chargpt"
 
     # data
     C.data = CharDataset.get_default_config()
 
     # model
     C.model = GPT.get_default_config()
-    C.model.model_type = 'gpt-mini'
+    C.model.model_type = "gopher-44m"
 
     # trainer
     C.trainer = Trainer.get_default_config()
-    C.trainer.learning_rate = 5e-4 # the model we're using is so small that we can go a bit faster
+    C.trainer.learning_rate = 1e-4 # the model we're using is no longer that small that we can't go faster
+
+    burt = False
+    C.model.burt = burt
+    C.trainer.burt = burt
+    C.burt = burt
 
     return C
 
@@ -47,7 +53,7 @@ class CharDataset(Dataset):
     @staticmethod
     def get_default_config():
         C = CN()
-        C.block_size = 128
+        C.block_size = 64
         return C
 
     def __init__(self, config, data):
@@ -55,7 +61,7 @@ class CharDataset(Dataset):
 
         chars = sorted(list(set(data)))
         data_size, vocab_size = len(data), len(chars)
-        print('data has %d characters, %d unique.' % (data_size, vocab_size))
+        print("data has %d characters, %d unique." % (data_size, vocab_size))
 
         self.stoi = { ch:i for i,ch in enumerate(chars) }
         self.itos = { i:ch for i,ch in enumerate(chars) }
@@ -83,7 +89,7 @@ class CharDataset(Dataset):
 
 # -----------------------------------------------------------------------------
 
-if __name__ == '__main__':
+if __name__ == "__main__":
 
     # get default config and overrides from the command line, if any
     config = get_config()
@@ -93,7 +99,7 @@ if __name__ == '__main__':
     set_seed(config.system.seed)
 
     # construct the training dataset
-    text = open('input.txt', 'r').read() # don't worry we won't run out of file handles
+    text = open("input.txt", "r").read() # don't worry we won't run out of file handles
     train_dataset = CharDataset(config.data, text)
 
     # construct the model
@@ -104,8 +110,10 @@ if __name__ == '__main__':
     # construct the trainer object
     trainer = Trainer(config.trainer, model, train_dataset)
 
+    wandb.init(project="mingpt-cubic")
     # iteration callback
     def batch_end_callback(trainer):
+        wandb.log(dict(loss=trainer.loss.item()))
 
         if trainer.iter_num % 10 == 0:
             print(f"iter_dt {trainer.iter_dt * 1000:.2f}ms; iter {trainer.iter_num}: train loss {trainer.loss.item():.5f}")
@@ -113,13 +121,13 @@ if __name__ == '__main__':
         if trainer.iter_num % 500 == 0:
             # evaluate both the train and test score
             model.eval()
-            with torch.no_grad():
-                # sample from the model...
-                context = "O God, O God!"
-                x = torch.tensor([train_dataset.stoi[s] for s in context], dtype=torch.long)[None,...].to(trainer.device)
-                y = model.generate(x, 500, temperature=1.0, do_sample=True, top_k=10)[0]
-                completion = ''.join([train_dataset.itos[int(i)] for i in y])
-                print(completion)
+            # with torch.no_grad():
+            #     # sample from the model...
+            #     context = "O God, O God!"
+            #     x = torch.tensor([train_dataset.stoi[s] for s in context], dtype=torch.long)[None,...].to(trainer.device)
+            #     y = model.generate(x, 500, temperature=1.0, do_sample=True, top_k=10)[0]
+            #     completion = ''.join([train_dataset.itos[int(i)] for i in y])
+            #     print(completion)
             # save the latest model
             print("saving model")
             ckpt_path = os.path.join(config.system.work_dir, "model.pt")
@@ -127,7 +135,7 @@ if __name__ == '__main__':
             # revert model to training mode
             model.train()
 
-    trainer.set_callback('on_batch_end', batch_end_callback)
+    trainer.set_callback("on_batch_end", batch_end_callback)
 
     # run the optimization
     trainer.run()

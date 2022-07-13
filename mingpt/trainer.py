@@ -35,8 +35,8 @@ class Trainer:
         self.callbacks = defaultdict(list)
 
         # determine the device we'll train on
-        if config.device == 'auto':
-            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if config.device == "auto":
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
             self.device = config.device
         self.model = self.model.to(self.device)
@@ -88,20 +88,29 @@ class Trainer:
             batch = [t.to(self.device) for t in batch]
             x, y = batch
 
-            # forward the model
-            logits, self.loss = model(x, y)
-
-            # backprop and update the parameters
+            # do the thing
             model.zero_grad(set_to_none=True)
-            self.loss.backward()
+            if not config.burt:
+                logits, self.loss = model(x, y)
+                self.loss.backward()
+            else:
+                total_loss = 0
+                ts = list(range(x.shape[1]))  # i.i.d with time
+                for i in ts:
+                    logits, loss = model(x[:, :i], y[:, :i])
+                    total_loss += loss.item() / len(ts)
+
+                self.loss = total_loss
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
             optimizer.step()
 
-            self.trigger_callbacks('on_batch_end')
+            # call meaningless signals
+            self.trigger_callbacks("on_batch_end")
             self.iter_num += 1
             tnow = time.time()
             self.iter_dt = tnow - self.iter_time
             self.iter_time = tnow
+            self.hello = "hi"
 
             # termination conditions
             if config.max_iters is not None and self.iter_num >= config.max_iters:

@@ -9,11 +9,10 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 """
 
 import math
-
 import torch
+import einops
 import torch.nn as nn
 from torch.nn import functional as F
-
 from mingpt.utils import CfgNode as CN
 
 # -----------------------------------------------------------------------------
@@ -44,9 +43,15 @@ class CausalSelfAttention(nn.Module):
         # regularization
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
+        self.big = self.config.big
+        if self.big:
+            self.pooler = nn.Linear(config.n_embd, 1, bias=False)
+            self.pooler2 = nn.Linear(config.n_embd, 1, bias=False)
         # causal mask to ensure that attention is only applied to the left in the input sequence
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                     .view(1, 1, config.block_size, config.block_size))
+        self.burt = self.config.burt
+        if not self.burt:
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
@@ -54,15 +59,42 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
+        if self.big:
+            scale_factor = 1.0 / math.sqrt(C)
+
+            # Caculate the global query
+            alpha_weight = torch.mul(
+                q.permute(0, 2, 1, 3),
+                self.pooler.weight.data.view(-1, C // self.n_head)).sum(dim=-1).permute(0, 2, 1) * scale_factor
+            alpha_weight = torch.softmax(alpha_weight, dim=-1)
+            global_query = q * alpha_weight.unsqueeze(-1)
+            global_query = torch.einsum("b h n d -> b h d", global_query)
+
+            # Model the interaction between global query vector and the key vector
+            repeat_global_query = einops.repeat(global_query, "b h d -> b h copy d", copy=T)
+            p = repeat_global_query * k
+            beta_weight = torch.mul(p.permute(0, 2, 1, 3),
+                                    self.pooler2.weight.data.view(-1, C // self.n_head)).sum(dim=-1).permute(0, 2, 1) * scale_factor
+            beta_weight = torch.softmax(beta_weight, dim=-1)
+            global_key = p * beta_weight.unsqueeze(-1)
+            global_key = torch.einsum("b h n d -> b h d", global_key)
+
+            # key-value
+            key_value_interaction = (einops.repeat(global_key, "b h d -> b h copy d", copy=T) * v).permute(0, 2, 1, 3)
+            key_value_interaction_out = self.c_proj(key_value_interaction.reshape(*key_value_interaction.shape[:-2], -1))
+            q_ = q.permute(0, 2, 1, 3)
+            result = self.resid_dropout(key_value_interaction_out + q_.view(*q_.shape[:-2], -1))
+            return result
+
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        if not self.config.burt:
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        if not self.burt:
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -101,7 +133,7 @@ class GPT(nn.Module):
     def get_default_config():
         C = CN()
         # either model_type or (n_layer, n_head, n_embd) must be given in the config
-        C.model_type = 'gpt'
+        C.model_type = "gpt"
         C.n_layer = None
         C.n_head = None
         C.n_embd =  None
@@ -128,19 +160,19 @@ class GPT(nn.Module):
             config.merge_from_dict({
                 # names follow the huggingface naming conventions
                 # GPT-1
-                'openai-gpt':   dict(n_layer=12, n_head=12, n_embd=768),  # 117M params
+                "openai-gpt":   dict(n_layer=12, n_head=12, n_embd=768),  # 117M params
                 # GPT-2 configs
-                'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-                'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-                'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-                'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+                "gpt2":         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+                "gpt2-medium":  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
+                "gpt2-large":   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
+                "gpt2-xl":      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
                 # Gophers
-                'gopher-44m':   dict(n_layer=8, n_head=16, n_embd=512),
+                "gopher-44m":   dict(n_layer=8, n_head=16, n_embd=512),
                 # (there are a number more...)
                 # I made these tiny models up
-                'gpt-mini':     dict(n_layer=6, n_head=6, n_embd=192),
-                'gpt-micro':    dict(n_layer=4, n_head=4, n_embd=128),
-                'gpt-nano':     dict(n_layer=3, n_head=3, n_embd=48),
+                "gpt-mini":     dict(n_layer=6, n_head=6, n_embd=192),
+                "gpt-micro":    dict(n_layer=4, n_head=4, n_embd=128),
+                "gpt-nano":     dict(n_layer=3, n_head=3, n_embd=48),
             }[config.model_type])
 
         self.transformer = nn.ModuleDict(dict(
@@ -155,7 +187,7 @@ class GPT(nn.Module):
         # init all weights, and apply a special scaled init to the residual projections, per GPT-2 paper
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
+            if pn.endswith("c_proj.weight"):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
         # report number of parameters (note we don't count the decoder parameters in lm_head)

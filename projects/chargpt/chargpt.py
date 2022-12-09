@@ -16,6 +16,10 @@ from mingpt.utils import set_seed, setup_logging, CfgNode as CN
 
 # -----------------------------------------------------------------------------
 
+use_burt = True
+very_big = True
+do_wandb = True  # True
+make_pth = False
 def get_config():
 
     C = CN()
@@ -34,9 +38,12 @@ def get_config():
 
     # trainer
     C.trainer = Trainer.get_default_config()
-    C.trainer.learning_rate = 1e-4 # the model we're using is no longer that small that we can't go faster
+    C.trainer.learning_rate = 1e-4  # the model we're using is no longer that small that we can't go faster
 
-    burt = False
+    big = very_big
+    C.model.big = big
+
+    burt = use_burt or big
     C.model.burt = burt
     C.trainer.burt = burt
     C.burt = burt
@@ -110,10 +117,12 @@ if __name__ == "__main__":
     # construct the trainer object
     trainer = Trainer(config.trainer, model, train_dataset)
 
-    wandb.init(project="mingpt-cubic")
+    if do_wandb:
+        wandb.init(project="mingpt-cubic")
     # iteration callback
     def batch_end_callback(trainer):
-        wandb.log(dict(loss=trainer.loss.item()))
+        if do_wandb:
+            wandb.log(dict(loss=trainer.loss.item()))
 
         if trainer.iter_num % 10 == 0:
             print(f"iter_dt {trainer.iter_dt * 1000:.2f}ms; iter {trainer.iter_num}: train loss {trainer.loss.item():.5f}")
@@ -129,9 +138,10 @@ if __name__ == "__main__":
             #     completion = ''.join([train_dataset.itos[int(i)] for i in y])
             #     print(completion)
             # save the latest model
-            print("saving model")
-            ckpt_path = os.path.join(config.system.work_dir, "model.pt")
-            torch.save(model.state_dict(), ckpt_path)
+            if make_pth:
+                print(" :: saving model :: it: ", trainer.iter_num)
+                ckpt_path = os.path.join(config.system.work_dir, "model.pt")
+                torch.save(model.state_dict(), ckpt_path)
             # revert model to training mode
             model.train()
 

@@ -95,12 +95,18 @@ class Trainer:
                 self.loss.backward()
             else:
                 total_loss = 0
-                ts = list(range(x.shape[1]))  # i.i.d with time
+                ts = list(range(1, x.shape[1]))  # i.i.d with time
                 for i in ts:
-                    logits, loss = model(x[:, :i], y[:, :i])
+                    logits, _ = model(
+                        x[:, :i].contiguous(),
+                        y[:, :i].contiguous())
+                    logits = logits.reshape(x.shape[0], i, -1)
+                    loss = torch.nn.functional.cross_entropy(
+                        logits[:, -1:].reshape(-1, logits.shape[-1]),
+                        y[:, i-1:i].flatten())
+                    loss.backward()
                     total_loss += loss.item() / len(ts)
-
-                self.loss = total_loss
+                self.loss = torch.tensor(total_loss)
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
             optimizer.step()
 

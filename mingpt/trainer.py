@@ -5,6 +5,7 @@ so nothing in this file really has anything to do with GPT specifically.
 
 import time
 from collections import defaultdict
+from .clusterer import Clusterer
 
 import torch
 from torch.utils.data.dataloader import DataLoader
@@ -21,11 +22,13 @@ class Trainer:
         C.num_workers = 4
         # optimizer parameters
         C.max_iters = None
-        C.batch_size = 64
+        C.batch_size = 32
         C.learning_rate = 3e-4
         C.betas = (0.9, 0.95)
         C.weight_decay = 0.1 # only applied on matmul weights
         C.grad_norm_clip = 1.0
+        C.val_every = 10
+        C.grad_acc = 2
         return C
 
     def __init__(self, config, model, train_dataset):
@@ -46,6 +49,7 @@ class Trainer:
         self.iter_num = 0
         self.iter_time = 0.0
         self.iter_dt = 0.0
+        self.val_every = config.val_every
 
     def add_callback(self, onevent: str, callback):
         self.callbacks[onevent].append(callback)
@@ -72,46 +76,65 @@ class Trainer:
             batch_size=config.batch_size,
             num_workers=config.num_workers,
         )
+        chunker = Clusterer()
+        chunker.fit(train_loader)
+        pred_val = lambda: (x[1] for x in train_loader)
+        pred = lambda: chunker.predict(train_loader)
 
         model.train()
         self.iter_num = 0
         self.iter_time = time.time()
-        data_iter = iter(train_loader)
+        data_iter = iter(pred())
+        val_iter = iter(pred_val())
         while True:
-
-            # fetch the next batch (x, y) and re-init iterator if needed
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(train_loader)
-                batch = next(data_iter)
-            batch = [t.to(self.device) for t in batch]
-            x, y = batch
-
-            # do the thing
             model.zero_grad(set_to_none=True)
-            if not config.burt:
-                logits, self.loss = model(x, y)
-                self.loss.backward()
-            else:
-                total_loss = 0
-                ts = list(range(1, x.shape[1]))  # i.i.d with time
-                for i in ts:
-                    logits, _ = model(
-                        x[:, :i].contiguous(),
-                        y[:, :i].contiguous())
-                    logits = logits.reshape(x.shape[0], i, -1)
-                    loss = torch.nn.functional.cross_entropy(
-                        logits[:, -1:].reshape(-1, logits.shape[-1]),
-                        y[:, i-1:i].flatten())
-                    loss.backward()
-                    total_loss += loss.item() / len(ts)
-                self.loss = torch.tensor(total_loss)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
-            optimizer.step()
+            for _ in range(config.grad_acc):
+                # fetch the next batch (x, y) and re-init iterator if needed
+                is_val = self.iter_num % self.val_every == 0
+                # model.cpu()
+                # optimizer.load_state_dict(optimizer.state_dict())
+                try:
+                    batch = next(data_iter if is_val else val_iter)
+                except StopIteration:   
+                    data_iter = iter(pred())
+                    val_iter = iter(pred_val())
+                    batch = next(data_iter if is_bal else val_iter)
+                # model.to(self.device)
+                # optimizer.load_state_dict(optimizer.state_dict())
+                batch = [t.to(self.device) for t in batch]
+                x, y = batch
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                # do the thing
+                if not config.burt:
+                    logits, self.loss = model(x, y)
+                    self.loss = self.loss / config.grad_acc
+                    if not is_val:
+                        self.loss.backward()
+                else:
+                    total_loss = 0
+                    ts = list(range(1, x.shape[1]))  # i.i.d with time
+                    for i in ts:
+                        logits, _ = model(
+                            x[:, :i].contiguous(),
+                            y[:, :i].contiguous())
+                        logits = logits.reshape(x.shape[0], i, -1)
+                        loss = torch.nn.functional.cross_entropy(
+                            logits[:, -1:].reshape(-1, logits.shape[-1]),
+                            y[:, i-1:i].flatten())
+                        loss.backward()
+                        total_loss += loss.item() / len(ts)
+                    self.loss = torch.tensor(total_loss)
+            if not is_val:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
+                optimizer.step()
 
             # call meaningless signals
             self.trigger_callbacks("on_batch_end")
+            if is_val:
+                self.trigger_callbacks("on_val_end")
             self.iter_num += 1
             tnow = time.time()
             self.iter_dt = tnow - self.iter_time

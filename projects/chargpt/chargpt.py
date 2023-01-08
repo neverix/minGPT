@@ -5,6 +5,9 @@ Trains a character-level language model.
 import os
 import sys
 import wandb
+import sys
+if "../.." not in sys.path:
+    sys.path.append("../..")
 
 import torch
 from torch.utils.data import Dataset
@@ -16,8 +19,8 @@ from mingpt.utils import set_seed, setup_logging, CfgNode as CN
 
 # -----------------------------------------------------------------------------
 
-use_burt = True
-very_big = True
+use_burt = False
+very_big = False
 do_wandb = True  # True
 make_pth = False
 def get_config():
@@ -60,7 +63,7 @@ class CharDataset(Dataset):
     @staticmethod
     def get_default_config():
         C = CN()
-        C.block_size = 64
+        C.block_size = 128
         return C
 
     def __init__(self, config, data):
@@ -92,7 +95,7 @@ class CharDataset(Dataset):
         # return as tensors
         x = torch.tensor(dix[:-1], dtype=torch.long)
         y = torch.tensor(dix[1:], dtype=torch.long)
-        return x, y
+        return chunk, (x, y)
 
 # -----------------------------------------------------------------------------
 
@@ -119,11 +122,12 @@ if __name__ == "__main__":
 
     if do_wandb:
         wandb.init(project="mingpt-cubic")
+    def val_end_callback(trainer):
+        if do_wandb:
+            wandb.log(dict(loss=trainer.loss.item()), step=int(trainer.iter_num / trainer.val_every * (trainer.val_every - 1)))
+
     # iteration callback
     def batch_end_callback(trainer):
-        if do_wandb:
-            wandb.log(dict(loss=trainer.loss.item()))
-
         if trainer.iter_num % 10 == 0:
             print(f"iter_dt {trainer.iter_dt * 1000:.2f}ms; iter {trainer.iter_num}: train loss {trainer.loss.item():.5f}")
 
@@ -146,6 +150,7 @@ if __name__ == "__main__":
             model.train()
 
     trainer.set_callback("on_batch_end", batch_end_callback)
+    trainer.set_callback("on_val_end", val_end_callback)
 
     # run the optimization
     trainer.run()
